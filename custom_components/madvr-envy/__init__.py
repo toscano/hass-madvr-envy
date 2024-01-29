@@ -1,0 +1,1 @@
+"""The madvr-envy component."""

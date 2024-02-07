@@ -35,6 +35,7 @@ from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 CONTROL_PROTOCOL_PORT   = 44077
 RETRY_CONNECT_INTERVAL  = timedelta(seconds=20)
 HEARTBEAT_INTERVAL      = timedelta(seconds=20)
+TRACK_TIME_INTERVAL     = timedelta(seconds= 5) # This MUST be smaller than HEARTBEAT_INTERVAL
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -119,7 +120,7 @@ class madVR_remote(RemoteEntity):
         self._extra_attributes = {}
         self.tasks = []
 
-        async_track_time_interval(self._hass, self._async_check_heartbeat, HEARTBEAT_INTERVAL)
+        async_track_time_interval(self._hass, self._async_check_heartbeat, TRACK_TIME_INTERVAL)
 
     async def async_added_to_hass(self) -> None:
         """Run when entity about to be added to hass."""
@@ -208,21 +209,23 @@ class madVR_remote(RemoteEntity):
 
         #_LOGGER.debug("%s:Heartbeat...CONNECTED [%i] [%s]", self._mac, self._sent_heartbeat, self._last_inbound_data_utc)
 
-        if (self._last_inbound_data_utc + HEARTBEAT_INTERVAL + HEARTBEAT_INTERVAL < dt_util.utcnow() ):
+        if ( (self._sent_heartbeat > 2) and (self._last_inbound_data_utc + HEARTBEAT_INTERVAL + HEARTBEAT_INTERVAL < dt_util.utcnow()) ):
+            # Schedule a re-connect...
+            _LOGGER.error("%s:HEARTBEAT...reconnect needed.", self._mac)
+            self._sent_heartbeat = 0
+            self._attr_is_on = False
+            self._reset_attributes()
+            self._hass.async_add_job(self._open_connection())
+            return
 
-            if (self._sent_heartbeat > 2):
-                # Schedule a re-connect...
-                _LOGGER.error("%s:HEARTBEAT...reconnect needed.", self._mac)
-                self._sent_heartbeat = 0
-                self._attr_is_on = False
-                self._reset_attributes()
-                self._hass.async_add_job(self._open_connection())
-                return
-
+        if (self._last_inbound_data_utc + HEARTBEAT_INTERVAL < dt_util.utcnow() ):
             self._sent_heartbeat = self._sent_heartbeat + 1
             if (self._sent_heartbeat > 1):
+                _LOGGER.info("%s:HEARTBEAT...sending Heartbeat %d", self._mac, self._sent_heartbeat)
+            else:
                 _LOGGER.debug("%s:HEARTBEAT...sending Heartbeat %d", self._mac, self._sent_heartbeat)
             self.send("Heartbeat")
+
         elif (self._sent_heartbeat > 0):
             if (self._sent_heartbeat > 1):
                 _LOGGER.debug("%s:HEARTBEAT...resetting Heartbeat %s",  self._mac, self._last_inbound_data_utc)
@@ -346,6 +349,12 @@ class madVR_remote(RemoteEntity):
         except GeneratorExit:
             return
 
+        except ConnectionResetError:
+            _LOGGER.info("%s:Connection reset by peer...reconnect needed.", self._mac)
+            self._queue_future.cancel()
+            self._net_future.cancel()
+            return
+
         except asyncio.CancelledError:
             _LOGGER.debug("%s:IO loop cancelled", self._mac)
             writer.close()
@@ -384,6 +393,7 @@ class madVR_remote(RemoteEntity):
                   s.startswith("RenameProfileGroup") or
                   s.startswith("CreateProfile")      or
                   s.startswith("RenameProfile" )     or
+                  s.startswith("MissingHeartbeat")   or
                   s.startswith("WELCOME")    ):
                 self._process_notification_message(s)
 
@@ -509,7 +519,10 @@ class madVR_remote(RemoteEntity):
 
         title, *signal_info = msg.split(" ")
 
-        if "NoSignal" in title:
+        if "MissingHeartbeat" in title:
+            _LOGGER.warn("%s:MissingHeartbeat", self._mac)
+
+        elif "NoSignal" in title:
             self._extra_attributes["incoming_signal"] = False
             self._extra_attributes["incoming_res"] = ""
             self._extra_attributes["incoming_frame_rate"] = ""
